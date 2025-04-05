@@ -80,7 +80,7 @@ contract Escrow is ReentrancyGuard {
     }
 
     function deposit(uint256 _amount) external payable onlyBuyer nonReentrant {
-        require(currentState == State.AWAITING_PAYMENT, "Already funded.");
+        require(currentState == State.AWAITING_PAYMENT, "Escrow is already funded.");
         require(_amount > 0, "Deposit amount must be greater than zero.");
 
         if (tokenAddress == address(0)) {
