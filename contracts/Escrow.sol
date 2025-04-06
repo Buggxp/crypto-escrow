@@ -1,58 +1,66 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.20;
 
-import "./openzeppelin/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 contract Escrow is ReentrancyGuard {
-    using SafeERC20 for IERC20;
-
-    address public immutable buyer;
-    address public immutable seller;
-    address public immutable arbiter;
-    uint256 public immutable escrowFee; // Fee percentage (e.g., 2 = 2%)
-    uint256 public immutable returnShipmentFee; // Fee percentage for returns
-    uint256 public immutable disputeTimeLimit; // Time limit for disputes in seconds
-
-    uint256 public amount; // Amount held in escrow
-    bool public isFunded; // Indicates if the escrow is funded
-    address public immutable tokenAddress; // Address of the ERC20 token (address(0) for ETH)
-
-    enum State { AWAITING_PAYMENT, AWAITING_DELIVERY, AWAITING_INSPECTION, COMPLETE, REFUNDED, DISPUTED }
-    State public currentState;
+    enum State {
+        AWAITING_PAYMENT,
+        AWAITING_DELIVERY,
+        AWAITING_INSPECTION,
+        COMPLETE,
+        REFUNDED,
+        DISPUTED
+    }
 
     struct Milestone {
         string description;
         uint256 payment;
         bool completed;
     }
+
+    address public immutable buyer;
+    address public immutable seller;
+    address public immutable arbiter;
+    IERC20 public immutable token;
+
+    uint256 public immutable escrowFee; // in %
+    uint256 public immutable returnShipmentFee; // in %
+    uint256 public immutable disputeTimeLimit;
+
+    uint256 public amount;
+    uint256 public lastActionTimestamp;
+    State public currentState;
+
     Milestone[] public milestones;
-
-    mapping(address => bool) private hasConfirmedInspection;
-    mapping(address => bool) private hasConfirmedShipment;
-
-    uint256 public shipmentStartTime;
-    uint256 public inspectionStartTime;
+    bool public shipmentMarked;
+    bool public deliveryConfirmed;
+    string public trackingNumber;
 
     event Deposit(address indexed buyer, uint256 amount);
-    event Refund(address indexed buyer, uint256 amount);
-    event DeliveryConfirmed(address indexed seller, uint256 amount);
-    event MilestoneCompleted(uint256 indexed milestoneIndex, uint256 payment);
-    event EmergencyWithdrawal(address indexed arbiter, uint256 amount);
+    event MilestoneCreated(string description, uint256 payment);
+    event MilestoneCompleted(uint256 index);
+    event ShipmentMarked(string trackingNumber);
+    event DeliveryConfirmed();
+    event Refunded(address indexed to, uint256 amount);
+    event DisputeOpened();
+    event DisputeResolved(address indexed to, uint256 amount);
+    event PartialRefund(address indexed to, uint256 amount);
+    event TimeoutRelease(address indexed seller, uint256 amount);
 
     modifier onlyBuyer() {
-        require(msg.sender == buyer, "Only the buyer can call this.");
+        require(msg.sender == buyer, "Only buyer");
         _;
     }
 
     modifier onlySeller() {
-        require(msg.sender == seller, "Only the seller can call this.");
+        require(msg.sender == seller, "Only seller");
         _;
     }
 
     modifier onlyArbiter() {
-        require(msg.sender == arbiter, "Only the arbiter can call this.");
+        require(msg.sender == arbiter, "Only arbiter");
         _;
     }
 
@@ -64,10 +72,8 @@ contract Escrow is ReentrancyGuard {
         uint256 _disputeTimeLimit,
         address _tokenAddress
     ) {
-        require(_seller != address(0), "Seller address cannot be zero.");
-        require(_arbiter != address(0), "Arbiter address cannot be zero.");
-        require(_escrowFee <= 100, "Escrow fee must be <= 100%.");
-        require(_returnShipmentFee <= 100, "Return shipment fee must be <= 100%.");
+        require(_seller != address(0) && _arbiter != address(0) && _tokenAddress != address(0), "Zero address");
+        require(_escrowFee <= 100 && _returnShipmentFee <= 100, "Fee too high");
 
         buyer = msg.sender;
         seller = _seller;
@@ -75,175 +81,146 @@ contract Escrow is ReentrancyGuard {
         escrowFee = _escrowFee;
         returnShipmentFee = _returnShipmentFee;
         disputeTimeLimit = _disputeTimeLimit;
-        tokenAddress = _tokenAddress;
+        token = IERC20(_tokenAddress);
         currentState = State.AWAITING_PAYMENT;
     }
 
-    function deposit(uint256 _amount) external payable onlyBuyer nonReentrant {
-        require(currentState == State.AWAITING_PAYMENT, "Escrow is already funded.");
-        require(_amount > 0, "Deposit amount must be greater than zero.");
+    function deposit(uint256 _amount) external onlyBuyer nonReentrant {
+        require(currentState == State.AWAITING_PAYMENT, "Wrong state");
+        require(_amount > 0, "Amount must be > 0");
 
-        if (tokenAddress == address(0)) {
-            // ETH deposit
-            require(msg.value == _amount, "Incorrect ETH amount sent.");
-            uint256 fee = (_amount * escrowFee) / 100;
-            amount = _amount - fee;
-        } else {
-            // ERC20 token deposit
-            IERC20 token = IERC20(tokenAddress);
-            require(token.allowance(msg.sender, address(this)) >= _amount, "Insufficient token allowance.");
-            uint256 fee = (_amount * escrowFee) / 100;
-            amount = _amount - fee;
+        uint256 fee = (_amount * escrowFee) / 100;
+        uint256 netAmount = _amount - fee;
 
-            // Transfer tokens from buyer to contract
-            token.safeTransferFrom(msg.sender, address(this), _amount);
-        }
-
-        isFunded = true;
-        shipmentStartTime = block.timestamp;
+        require(token.transferFrom(buyer, address(this), _amount), "Transfer failed");
+        amount += netAmount;
         currentState = State.AWAITING_DELIVERY;
+        lastActionTimestamp = block.timestamp;
 
-        emit Deposit(msg.sender, _amount);
+        emit Deposit(msg.sender, netAmount);
     }
 
-    function createMilestone(string calldata _description, uint256 _payment) external onlyBuyer {
-        require(currentState == State.AWAITING_DELIVERY, "Cannot create milestone now.");
-        require(bytes(_description).length > 0, "Milestone description cannot be empty.");
-        require(_payment > 0, "Milestone payment must be greater than zero.");
-        require(_payment <= amount, "Milestone payment exceeds available funds.");
+    function createMilestone(string memory _desc, uint256 _payment) external onlyBuyer {
+        require(currentState != State.COMPLETE, "Already complete");
+        require(bytes(_desc).length > 0, "Empty description");
+        require(_payment > 0 && _payment <= amountRemainingForMilestones(), "Invalid payment");
 
-        milestones.push(Milestone(_description, _payment, false));
+        milestones.push(Milestone(_desc, _payment, false));
+        emit MilestoneCreated(_desc, _payment);
     }
 
-    function markAsShipped() external onlySeller {
-        require(currentState == State.AWAITING_DELIVERY, "Not in delivery state.");
-        hasConfirmedShipment[seller] = true; // Update the mapping for the seller
+    function completeMilestone(uint256 index) external onlyBuyer nonReentrant {
+        require(index < milestones.length, "Invalid index");
+        Milestone storage m = milestones[index];
+        require(!m.completed, "Already completed");
+        require(m.payment <= amount, "Insufficient funds");
+
+        m.completed = true;
+        amount -= m.payment;
+        require(token.transfer(seller, m.payment), "Transfer failed");
+
+        emit MilestoneCompleted(index);
     }
 
-    function confirmShipment() external onlyBuyer {
-        require(currentState == State.AWAITING_DELIVERY, "Not in delivery state.");
-        require(hasConfirmedShipment[seller], "Seller has not marked as shipped.");
-        require(block.timestamp <= shipmentStartTime + disputeTimeLimit, "Time limit exceeded.");
+    function markAsShipped(string memory _trackingNumber) external onlySeller {
+        require(currentState == State.AWAITING_DELIVERY, "Wrong state");
+        require(!shipmentMarked, "Already marked");
+        require(bytes(_trackingNumber).length > 0, "Tracking required");
 
+        shipmentMarked = true;
+        trackingNumber = _trackingNumber;
         currentState = State.AWAITING_INSPECTION;
-        inspectionStartTime = block.timestamp;
-    }
+        lastActionTimestamp = block.timestamp;
 
-    function markAsInspected() external onlyBuyer {
-        require(currentState == State.AWAITING_INSPECTION, "Cannot mark as inspected.");
-        hasConfirmedInspection[buyer] = true;
+        emit ShipmentMarked(_trackingNumber);
     }
 
     function confirmDelivery() external onlyBuyer nonReentrant {
-        require(currentState == State.AWAITING_INSPECTION, "Cannot confirm delivery.");
-        require(hasConfirmedInspection[buyer], "Buyer has not inspected goods.");
+        require(currentState == State.AWAITING_INSPECTION, "Wrong state");
+        require(shipmentMarked, "Not shipped yet");
 
+        deliveryConfirmed = true;
         currentState = State.COMPLETE;
-        uint256 paymentAmount = amount;
-        amount = 0; // Prevent reentrancy
+        uint256 remaining = amount;
+        amount = 0;
+        require(token.transfer(seller, remaining), "Transfer failed");
 
-        if (tokenAddress == address(0)) {
-            // ETH transfer
-            (bool success, ) = seller.call{value: paymentAmount}("");
-            require(success, "Transfer to seller failed.");
-        } else {
-            // ERC20 token transfer
-            IERC20 token = IERC20(tokenAddress);
-            token.safeTransfer(seller, paymentAmount);
-        }
-
-        emit DeliveryConfirmed(seller, paymentAmount);
+        emit DeliveryConfirmed();
     }
 
-    function refundBuyer() external onlyArbiter nonReentrant {
-        require(currentState == State.AWAITING_INSPECTION, "Cannot refund now.");
-        require(block.timestamp > inspectionStartTime + disputeTimeLimit, "Dispute time limit not exceeded.");
+    function openDispute() external onlyBuyer {
+        require(currentState == State.AWAITING_INSPECTION, "Cannot dispute now");
+        currentState = State.DISPUTED;
+        emit DisputeOpened();
+    }
 
+    function resolveDispute(bool refundBuyer, uint256 refundAmount) external onlyArbiter nonReentrant {
+        require(currentState == State.DISPUTED, "Not disputed");
+        require(refundAmount <= amount, "Refund too much");
+
+        amount -= refundAmount;
+        address recipient = refundBuyer ? buyer : seller;
+        require(token.transfer(recipient, refundAmount), "Transfer failed");
+
+        if (amount == 0) currentState = State.COMPLETE;
+        emit DisputeResolved(recipient, refundAmount);
+    }
+
+    function refundBuyer() external onlySeller nonReentrant {
+        require(currentState == State.AWAITING_DELIVERY || currentState == State.AWAITING_INSPECTION, "Wrong state");
+        uint256 refund = (amount * (100 - returnShipmentFee)) / 100;
+        amount = 0;
         currentState = State.REFUNDED;
-        uint256 refundAmount = amount;
-        amount = 0; // Prevent reentrancy
+        require(token.transfer(buyer, refund), "Transfer failed");
+        emit Refunded(buyer, refund);
+    }
 
-        if (tokenAddress == address(0)) {
-            // ETH refund
-            (bool success, ) = buyer.call{value: refundAmount}("");
-            require(success, "Refund to buyer failed.");
-        } else {
-            // ERC20 token refund
-            IERC20 token = IERC20(tokenAddress);
-            token.safeTransfer(buyer, refundAmount);
+    function partialRefund(uint256 refundAmount) external onlySeller nonReentrant {
+        require(refundAmount > 0 && refundAmount <= amount, "Invalid refund amount");
+        amount -= refundAmount;
+        require(token.transfer(buyer, refundAmount), "Transfer failed");
+        emit PartialRefund(buyer, refundAmount);
+    }
+
+    function timeoutRelease() external onlySeller nonReentrant {
+        require(currentState == State.AWAITING_INSPECTION, "Not inspectable");
+        require(block.timestamp > lastActionTimestamp + disputeTimeLimit, "Too early");
+
+        uint256 remaining = amount;
+        amount = 0;
+        currentState = State.COMPLETE;
+        require(token.transfer(seller, remaining), "Transfer failed");
+
+        emit TimeoutRelease(seller, remaining);
+    }
+
+    function getMilestone(uint256 index) external view returns (string memory, uint256, bool) {
+        require(index < milestones.length, "Invalid index");
+        Milestone memory m = milestones[index];
+        return (m.description, m.payment, m.completed);
+    }
+
+    function milestoneCount() external view returns (uint256) {
+        return milestones.length;
+    }
+
+    function getCurrentState() external view returns (string memory) {
+        if (currentState == State.AWAITING_PAYMENT) return "AWAITING_PAYMENT";
+        if (currentState == State.AWAITING_DELIVERY) return "AWAITING_DELIVERY";
+        if (currentState == State.AWAITING_INSPECTION) return "AWAITING_INSPECTION";
+        if (currentState == State.COMPLETE) return "COMPLETE";
+        if (currentState == State.REFUNDED) return "REFUNDED";
+        if (currentState == State.DISPUTED) return "DISPUTED";
+        return "UNKNOWN";
+    }
+
+    function amountRemainingForMilestones() public view returns (uint256 remaining) {
+        uint256 committed;
+        for (uint256 i = 0; i < milestones.length; i++) {
+            if (!milestones[i].completed) {
+                committed += milestones[i].payment;
+            }
         }
-
-        emit Refund(buyer, refundAmount);
-    }
-
-    function returnShipment() external onlyBuyer nonReentrant {
-        require(currentState == State.AWAITING_INSPECTION, "Cannot return shipment now.");
-
-        uint256 penaltyAmount = (amount * returnShipmentFee) / 100;
-        uint256 sellerAmount = amount - penaltyAmount;
-        amount = 0; // Prevent reentrancy
-
-        currentState = State.REFUNDED;
-
-        if (tokenAddress == address(0)) {
-            // ETH transfers
-            (bool successSeller, ) = seller.call{value: sellerAmount}("");
-            require(successSeller, "Transfer to seller failed.");
-
-            (bool successArbiter, ) = arbiter.call{value: penaltyAmount}("");
-            require(successArbiter, "Transfer to arbiter failed.");
-        } else {
-            // ERC20 token transfers
-            IERC20 token = IERC20(tokenAddress);
-            token.safeTransfer(seller, sellerAmount);
-            token.safeTransfer(arbiter, penaltyAmount);
-        }
-    }
-
-    function completeMilestone(uint256 milestoneIndex) external onlyBuyer nonReentrant {
-        require(milestoneIndex < milestones.length, "Invalid milestone index.");
-
-        Milestone storage milestone = milestones[milestoneIndex];
-        require(!milestone.completed, "Milestone already completed.");
-        require(milestone.payment <= amount, "Insufficient funds for milestone.");
-
-        milestone.completed = true;
-        amount -= milestone.payment;
-
-        if (tokenAddress == address(0)) {
-            // ETH transfer
-            (bool success, ) = seller.call{value: milestone.payment}("");
-            require(success, "Transfer to seller failed.");
-        } else {
-            // ERC20 token transfer
-            IERC20 token = IERC20(tokenAddress);
-            token.safeTransfer(seller, milestone.payment);
-        }
-
-        emit MilestoneCompleted(milestoneIndex, milestone.payment);
-    }
-
-    function emergencyWithdraw() external onlyArbiter {
-        uint256 balance = address(this).balance;
-        if (tokenAddress == address(0)) {
-            (bool success, ) = arbiter.call{value: balance}("");
-            require(success, "Emergency withdrawal failed.");
-        } else {
-            IERC20 token = IERC20(tokenAddress);
-            uint256 tokenBalance = token.balanceOf(address(this));
-            token.safeTransfer(arbiter, tokenBalance);
-        }
-
-        emit EmergencyWithdrawal(arbiter, balance);
-    }
-
-    // Fallback function to prevent accidental Ether transfers
-    fallback() external payable {
-        revert("Direct Ether transfers not allowed. Use the deposit function.");
-    }
-
-    // Receive function to handle Ether sent directly to the contract
-    receive() external payable {
-        revert("Direct Ether transfers not allowed.");
+        return amount - committed;
     }
 }
