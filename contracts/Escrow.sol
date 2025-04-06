@@ -62,7 +62,7 @@ contract Escrow is ReentrancyGuard {
         uint256 _escrowFee,
         uint256 _returnShipmentFee,
         uint256 _disputeTimeLimit,
-        address _tokenAddress // Address of the ERC20 token (use address(0) for ETH)
+        address _tokenAddress
     ) {
         require(_seller != address(0), "Seller address cannot be zero.");
         require(_arbiter != address(0), "Arbiter address cannot be zero.");
@@ -117,7 +117,7 @@ contract Escrow is ReentrancyGuard {
 
     function markAsShipped() external onlySeller {
         require(currentState == State.AWAITING_DELIVERY, "Not in delivery state.");
-        hasConfirmedShipment[buyer] = true;
+        hasConfirmedShipment[seller] = true; // Update the mapping for the seller
     }
 
     function confirmShipment() external onlyBuyer {
